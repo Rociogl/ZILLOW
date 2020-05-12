@@ -1,0 +1,1701 @@
+---
+title:  "**Análisis y Predicción Dataset ZILLOW**"
+author: "Rocio Gutiérrez López, Álvaro Caballero Villarreal, Raúl Zornoza Lebrons y Marcos Alberto Pazos Lopez"
+date:   "`r Sys.Date()`"
+output:
+  html_document: 
+    theme:       cerulean 
+    highlight:   haddock 
+    toc:         true
+    toc_float:   true
+    code_folding: show
+  pdf_document:  default
+  word_document: default
+urlcolor: magenta
+---
+
+
+<center>
+![](./imágenes/logo-eoi.png)
+</center>
+<center>
+![](./imágenes/logo zillow.png)
+</center>
+
+# **1. Resumen ejecutivo**
+
+Para llevar a cabo este proyecto hacemos uso del dataset de los precios de venta y la estimación previa de dichos precios en el estado de California, en los condados de Ventura, Orange y Los Angeles, proporcionado por kaggle en la competición llamada Zillow Price en la que lo que se busca predecir es el logerror (logerror=log(Zestimate)−log(SalePrice)).
+
+Por lo que estamos haciendo un análisis residual, la diferencia entre el valor real de la variable dependiente y el valor predicho es lo que se denomina residuo. Todos estos residuos son las porciones sin explicación del modelo actual, por lo que prediciendo las partes que todavía no tienen una explicación correcta mejoraremos el modelo añadiendo las nuevas predicciones encima de las existentes, dando resultado a una predicción mejorada. 
+
+En primer lugar, lo que se hace es realizar una limpieza y pre-procesado exhaustiva en la que se examina si el tipo de variable esta correctamente registrado, se crean variables categóricas, se lleva a cabo One Hot Encoding para XGBoost, se tratan los Na´s y se eliminan los outliers. Finalmente, el dataset que se va a utilizar posee más de 100.000 observaciones.
+
+Después de la limpieza intentamos incorporar variables externas para enriquecer nuestro modelo, tales como datos de salud de los condados, indicadores de desempleo, demografía, tasa de crimen, número de viviendas desglosadas en tipo o salario medio de una unidad familiar. Tuvimos varios problemas a la hora de cruzarlos y además nos arrojaban muchos NA´s por lo que finalmente descartamos este proceso.
+
+Para el modelado, en primera instancia la idea era crear un ensamble con varios modelos muy diferentes entre sí entre los cuales estuviera incluido XGBoost, tras hacer varias pruebas se comprobó que los resultados del ensamble eran peores que los del XGBoost de manera aislada. Por lo que finalmente se decidió crear un GBM y un XGBoost que en principio son dos modelos similares, pero nos sirven para llevar acabo una comparativa entre interpretabilidad y grado de ajuste. Estos dos elementos son clave a la hora de seleccionar un modelo de ML y dependiendo del cliente preferirá tener un mejor ajuste, aunque lleve mayor grado de abstracción o poseer un error un poco mayor pero que el modelo se pueda comprender de manera más sencilla.
+
+# **2. Importación de librerías y carga de datos** {.tabset .tabset-fade .tabset-pills}
+```{r, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(readxl)
+library(readr)
+library(yaztheme) #remotes::install_github("joshyazman/yaztheme")
+library(leaflet)
+library(corrplot)
+library(data.table)
+library(DT)
+require(stringr) 
+library(tidyverse)
+library(caret)
+library(tidymodels)
+library(skimr)
+library(DataExplorer) 
+library(ggpubr)
+library(univariateML)
+library(GGally)
+library(knitr)
+library(dplyr)
+library(h2o)
+library(DALEX)
+library(DALEXtra)
+library(univariateML)
+library(iml)
+library(caret)
+library(lubridate) 
+library(doParallel)
+library(xgboost)
+library(mltools)
+library(data.table)  
+library(MLmetrics)
+library(Matrix)
+mipaleta <- c("#ECACF5", "#E47BF3", "#7632FC", "#6377D0", "#A8B8FF")
+```
+
+```{r message=FALSE, warning=FALSE}
+data_dict <- read_excel("./data/zillow_data_dictionary.xlsx")
+all_2016 <- read_csv('./data/properties_2016.csv')
+train_2016 <- read_csv('./data/train_2016_v2.csv')
+all_2017 <- read_csv('./data/properties_2017.csv')
+train_2017 <- read_csv('./data/train_2017.csv')
+full_2016 <- left_join(train_2016, all_2016)
+full_2017 <- left_join(train_2017, all_2017)
+full_data <- full_join(full_2016, full_2017)
+```
+
+### **2.1 Tabla datasets**  {.tabset .tabset-fade .tabset-pills}
+
+## Properties 2016
+```{r}
+datatable(head(all_2016,100), style="bootstrap", class="bootstrap", options = list(dom = 'tp',scrollX = TRUE))
+```
+
+## Train 2016
+```{r}
+datatable(head(train_2016,100), style="bootstrap", class="table-condensed", options = list(dom = 'tp',scrollX = TRUE))
+```
+
+## Properties 2017
+```{r}
+datatable(head(all_2017,100), style="bootstrap", class="table-condensed", options = list(dom = 'tp',scrollX = TRUE)) 
+```
+
+## Train 2017
+```{r}
+datatable(head(train_2017,100), style="bootstrap", class="table-condensed", options = list(dom = 'tp',scrollX = TRUE))
+```
+
+## Dataset que se va a utilizar como base 
+```{r}
+datatable(head(full_data,100), style="bootstrap", class="table-condensed", options = list(dom = 'tp',scrollX = TRUE))
+```
+
+# **3. EDA y selección de predictores ** {.tabset .tabset-fade .tabset-pills}
+
+!!! - Pulsa en estructura para cargarlo :)
+
+## Dimensión del dataset completo
+```{r}
+dim(full_data)
+```
+
+## 10 primeras filas
+```{r}
+datatable(head(full_data), style="bootstrap", class="table-condensed", options = list(dom = 'tp',scrollX = TRUE))
+```
+
+## Estructura
+```{r}
+datatable(str(full_data), style="bootstrap", class="table-condensed", options = list(dom = 'tp',scrollX = TRUE))
+```
+
+### **3.1 EDA y correción de variables categóricas**
+Antes de entrenar un modelo predictivo, es muy importante realizar una exploración descriptiva de los datos que se poseen. Este proceso permite entender mejor qué información contiene cada variable, así como detectar posibles errores y llevar a cabo una limpieza exhaustiva. El objetivo es detectar si hay columnas que están almacenadas con el tipo incorrecto o si hay variables que no tienen sentido, como por ejemplo que en metros cuadrados el piso sea 0, es ilógico.
+
+Cuando se entrena un modelo, es importante incluir como predictores únicamente aquellas variables que están realmente relacionadas con la variable respuesta, ya que son estas las que contienen información útil para el modelo. Incluir un exceso de variables suele conllevar una reducción de la capacidad predictiva del modelo cuando se expone a nuevos datos (overfitting).
+
+Algunos algoritmos de Machine Learning, como por ejemplo Random Forest, Lasso o Boosting, contienen sus propias estrategias para seleccionar predictores. A pesar de ello, se decide llevar a cabo un pre-procesado y una selección de variables, con el fin de eliminar el mayor ruido posible.
+
+Cambio del nombre de las variables, de manera que así se puedan comprender e intuir mucho más rápido.
+```{r}
+names(full_data) <- c('id_parcel', 'log_error', 'transaction_date', 'air_conditioning_typeid','architectural_style_typeid',
+                      'basement_sqft', 'bathroom_cnt', 'bedroom_cnt','building_class_typeid','building_quality_typeid',
+                      'calculated_bathroom','deck_typeid','size_finished_living_area_1', 'calculated_finished_living_area',
+                      'finished_living_area','perimeter_living_area','total_area','size_finished_living_area_2',
+                      'base_unfinished_finished_area','federal_information_processing','number_fireplaces',
+                      'number_full_bathrooms','number_garages','number_square_feet_garages','have_hottub_or_spa', 
+                      'type_heating_system','latitude','longitude','lot_size_square_feet','number_pools','pool_size_sum',
+                      'pool_type','pool_with_spa_hottub', 'pool_without_spa_hottub','zoning_county_level', 'type_land_use',
+                      'allowed_land_uses','raw_census__and_blockid_1','id_city','id_county','id_neighborhood','id_zip', 
+                      'room_cnt', 'story_typeid','number_3_4_bathrooms','type_construction_typeid', 
+                      'number_units_structure_built', 'patio_in_yard', 'Storage_shed/building_in_yard',
+                      'year_built','number_stories','fire_place_flag','assessed_value_built_structure',
+                      'total_tax_assessed_value','tax_assessment_year', 'assessed_value_land_area', 'tax_amount', 
+                      'tax_delinquency_flag','tax_delinquency_year', 'raw_census__and_blockid_2')
+
+
+full_data_original <- full_data
+full_data_original$latitude = full_data_original$latitude/1000000
+full_data_original$longitude = full_data_original$longitude/1000000
+```
+#### Revisión de filas duplicadas
+```{r}
+cat("El número de filas duplicadas es:", nrow(full_data) - nrow(unique(full_data)))
+```
+#### Descripción estadística de todas las variables en bruto
+Para llevar a cabo el EDA se utiliza el paquete DataExplorer, que para casos como este es muy útil ya que hace que llevar a cabo el EDA  y la limpieza sea mucho más fácil que con un summary.
+```{r}
+skim(full_data)
+```
+
+Antes de llevar a cabo una gran limpieza de NA´s revisamos las variables categóricas o las que podrían serlo y no estan categorizadas de esta forma, ya que modificándolas un poco podemos hacer que esos NA´s se conviertan en una nivel de la variable factor y así nutrir nuestro modelo. Este proceso tiene especialmente sentido en las variables lógicas.
+
+#### Análisis de las variables categóricas y lógicas.
+```{r, echo = TRUE, fig.align='center',  fig.height=5, fig.width=10, message=FALSE}
+plot_bar(
+  full_data,
+  ncol    = 3, nrow = 4,
+  ggtheme = theme_minimal(),
+  theme_config = list(
+                   strip.text = element_text(colour = "#D88EF1", size = 10, face = 2),
+                   legend.position = "none"
+                  )
+)
+```
+
+#### Tax_delinquency_flag
+Esta variable significa que los impuestos a la propiedad para este paquete están vencidos a partir de 2015. Esta variable es un claro ejemplo de cómo a veces lo datos vienen mal registrados y si no se examinan con exactitud se puede cometer graves errores. 
+Automáticamente el sistema registra como NA los que no tienen vencido ese impuesto, lo que hay que hacer es convertir los NA en un nivel y dejar una variable que sea dicotómica YES o NO. Además, se aprecia como muy pocas viviendas en la muestra poseen este retraso.
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+full_data %>% mutate(tax_delinquency_flag = as.factor(tax_delinquency_flag))
+```
+
+```{r, message=FALSE, warning=FALSE}
+full_data <- full_data %>% mutate(tax_delinquency_flag = recode_factor(tax_delinquency_flag, .missing = "NO"))
+```
+
+```{r, fig.align='center'}
+full_data %>% 
+  ggplot(aes(x=as.factor(tax_delinquency_flag), y=(log_error), color = tax_delinquency_flag)) + 
+  geom_jitter(alpha=0.3, color='#99B4E9') +
+  geom_boxplot(outlier.color="#8E60E3", color='#6800FF') + 
+  labs(x='Impuestos vencidos', title ='Distribución del log error en función de impuestos vencidos')+
+  theme_minimal() 
+```
+
+#### Fire_place_flag
+```{r, message=FALSE, warning=FALSE, paged.print=FALSE}
+full_data <- full_data %>% mutate(fire_place_flag = as.factor(fire_place_flag))
+levels <- levels(full_data$fire_place_flag)
+levels[length(levels) + 1] <- "FALSE"
+full_data$fire_place_flag <- factor(full_data$fire_place_flag, levels = levels)
+full_data$fire_place_flag[is.na(full_data$fire_place_flag)] <- "FALSE"
+```
+Esta variable indica si posee chimenea o no. Por ejemplo esta variable si que tiene sentido binarizarla, es decir, crear nuevas variables dummy con cada uno de los niveles de las variables cualitativas. Pero no se va a llevar a cabo este proceso de manera manual ya que hay modelos que las crean de manera automática en su proceso, como se apreciará más adelante con Xgboost.
+
+#### Have_hottub_or_spa, pool_type y pool_with_spa/hottub
+Las 3 variables coinciden en que tienen muy pocos valores con TRUE y resto con NA, se lleva a cabo el mismo proceso que se llevó con tax_delinquency_flag y los NA´s se convierten en FALSE.
+```{r, mesagge = FALSE}
+full_data <- full_data %>% mutate(have_hottub_or_spa = as.factor(have_hottub_or_spa))
+levels1 <- levels(full_data$have_hottub_or_spa)
+levels1[length(levels) + 1] <- "FALSE"
+full_data$have_hottub_or_spa <- factor(full_data$have_hottub_or_spa, levels = levels1)
+full_data$have_hottub_or_spa[is.na(full_data$have_hottub_or_spa)] <- "FALSE"
+
+full_data <- full_data %>% mutate(pool_type = as.factor(pool_type))
+levels2 <- levels(full_data$pool_type)
+levels2[length(levels) + 1] <- "FALSE"
+full_data$pool_type <- factor(full_data$pool_type, levels = levels2)
+full_data$pool_type[is.na(full_data$pool_type)] <- "FALSE"
+
+full_data <- full_data %>% mutate(pool_with_spa_hottub = as.factor(pool_with_spa_hottub))
+levels3 <- levels(full_data$pool_with_spa_hottub)
+levels3[length(levels) + 1] <- "FALSE"
+full_data$pool_with_spa_hottub <- factor(full_data$pool_with_spa_hottub, levels = levels3)
+full_data$pool_with_spa_hottub[is.na(full_data$pool_with_spa_hottub)] <- "FALSE"
+```
+
+#### Deck_typeid
+```{r}
+full_data <- full_data %>% mutate(deck_typeid = as.factor(deck_typeid))
+levels4 <- levels(full_data$deck_typeid)
+levels4[length(levels) + 1] <- "FALSE"
+full_data$deck_typeid <- factor(full_data$deck_typeid, levels = levels4)
+full_data$deck_typeid[is.na(full_data$deck_typeid)] <- "FALSE"
+```
+
+#### Building_class_typeid
+```{r}
+full_data <- full_data %>% mutate(building_class_typeid = as.factor(building_class_typeid))
+levels11 <- levels(full_data$building_class_typeid)
+levels11[length(levels) + 1] <- "ANOTHER"
+full_data$building_class_typeid <- factor(full_data$building_class_typeid, levels = levels11)
+full_data$building_class_typeid[is.na(full_data$building_class_typeid)] <- "ANOTHER"
+skim(full_data$building_class_typeid)
+```
+Se puede apreciar como después convertir la variable a categórica, el nivel en el que más observacioens hay, es del tipo edificios con marcos de madera o madera y acero. Se mantiene esta variable aunque realmente no aporte gran información y la inmensa mayoría están en el nivel another que se ha creado. 
+A pesar de ello se decide mantenerla, ya que el modelo se encargará de desecharla si confirma las sospechas de que realmente no aporta nada.
+
+#### Building_quality_typeid
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+full_data <- full_data %>% mutate(building_quality_typeid = as.factor(building_quality_typeid))
+levels12 <- levels(full_data$building_quality_typeid)
+levels12[length(levels) + 1] <- "ANOTHER"
+full_data$building_quality_typeid <- factor(full_data$building_quality_typeid, levels = levels12)
+full_data$building_quality_typeid[is.na(full_data$building_quality_typeid)] <- "ANOTHER"
+```
+```{r, fig.align='center'}
+full_data %>% 
+  ggplot(aes(x=as.factor(building_quality_typeid), y=(log_error), color = building_quality_typeid)) + 
+  geom_jitter(alpha=0.3, color='#99B4E9') +
+  geom_boxplot(outlier.color="#8E60E3", color='#6800FF') + 
+  labs(x='Calidad de construcción', title ='Distribución del log error en función de la calidad de construcción')+
+  theme_minimal() 
+```
+Se observa como es basante intuitivo que los NA´s encajan con el número que falta.
+
+#### Air_conditioning_typeid
+```{r}
+full_data <- full_data %>% mutate(air_conditioning_typeid = as.factor(air_conditioning_typeid))
+levels13 <- levels(full_data$air_conditioning_typeid)
+levels13[length(levels) + 1] <- "ANOTHER"
+full_data$air_conditioning_typeid <- factor(full_data$air_conditioning_typeid, levels = levels13)
+full_data$air_conditioning_typeid[is.na(full_data$air_conditioning_typeid)] <- "ANOTHER"
+```
+
+```{r, fig.align='center'}
+full_data %>% 
+  ggplot(aes(x=as.factor(air_conditioning_typeid), y=(log_error), color = air_conditioning_typeid)) + 
+  geom_jitter(alpha=0.3, color='#99B4E9') +
+  geom_boxplot(outlier.color="#8E60E3", color='#6800FF') + 
+  labs(x='Tipo de aire acondicionado', title ='Distribución del log error en función del tipo de aire acondicionado')+
+  theme_minimal() 
+```
+
+#### Number_fireplaces
+```{r}
+full_data <- full_data %>% mutate(number_fireplaces = as.factor(number_fireplaces))
+levels14 <- levels(full_data$number_fireplaces)
+levels14[length(levels) + 1] <- "ANOTHER"
+full_data$number_fireplaces <- factor(full_data$number_fireplaces, levels = levels14)
+full_data$number_fireplaces[is.na(full_data$number_fireplaces)] <- "ANOTHER"
+```
+
+#### Number_garages
+```{r}
+full_data <- full_data %>% mutate(number_garages = as.factor(number_garages))
+levels16 <- levels(full_data$number_garages)
+levels16[length(levels) + 1] <- "FALSE"
+full_data$number_garages <- factor(full_data$number_garages, levels = levels16)
+full_data$number_garages[is.na(full_data$number_garages)] <- "FALSE"
+```
+El número de chimeneas o garajes, son variables que como principal idea obviamente son numéricas, pero la intención es no tratar esos NA´s como un 0 ya que por ejemplo hay 525 viviendas que registraron tener 0 chimeneas, por lo que ese 0 ya esta registrado, si no tratarlas como una variable categórica, en la que esta dentro de una categoría.
+
+#### Type_heating_system	
+```{r}
+full_data <- full_data %>% mutate(type_heating_system = as.factor(type_heating_system))
+levels18 <- levels(full_data$type_heating_system)
+levels18[length(levels) + 1] <- "FALSE"
+full_data$type_heating_system <- factor(full_data$type_heating_system, levels = levels18)
+full_data$type_heating_system[is.na(full_data$type_heating_system)] <- "FALSE"
+```
+En este caso, el tipo 2 es calefacción central y la mayoría poseen dicho tipo.
+
+#### Federal_information_processing
+```{r}
+table(full_data$federal_information_processing)
+```
+Se observa la distribución de los valores de la variable federal_information_processing y se ve como la mayoría de los datos están en una de las 3 categorías. Dado que únicamente existen 34 NA´s se decide eliminar las observaciones y no crear una dummy para esos NA´s.
+```{r}
+full_data <- full_data %>% mutate(federal_information_processing = as.factor(federal_information_processing))
+full_data = full_data [!is.na(full_data$federal_information_processing),]
+```
+Se intuye que serán identificadores que corresponderán con cada uno de los condados del dataset.
+```{r, fig.align='center'}
+full_data %>% 
+  ggplot(aes(x=as.factor(federal_information_processing), y=(log_error), color = federal_information_processing)) + 
+  geom_jitter(alpha=0.3, color='#99B4E9') +
+  geom_boxplot(outlier.color="#8E60E3", color='#6800FF') + 
+  labs(x='Federal information', title ='Distribución del log error en función del federal information')+
+  theme_minimal() 
+```
+
+#### Zoning_county_level
+```{r}
+unique(full_data$zoning_county_level)
+full_data <- full_data %>% mutate(zoning_county_level = as.factor(zoning_county_level))
+```
+Esta variable indica los diferentes códigos de uso de la tierra en los condados, que como se puede apreciar existe gran variedad, en concreto hay 90 tipos y 35 Na´s que al ser tan pocos se decide eliminarlos.
+Se observa como la mayoría de las observaciones pertenecen a los tipos: 0100, 010C, 122.  Posee 90 niveles y hay modelos que no van a poder lidiar con ello por lo que se elimina esta variable.
+```{r}
+full_data = full_data [!is.na(full_data$zoning_county_level),]
+skim(full_data$zoning_county_level)
+full_data = subset(full_data, select = -c(zoning_county_level) )
+```
+
+#### Allowed_land_uses
+Esta variable en principio es similar a la anterior, ya que consiste en la descripción de los usos del suelo permitidos (zonificación) para esa propiedad. Posee 2346 niveles y hay modelos que no van a poder lidiar con ello por lo que se elimina esta variable.
+```{r}
+#table(full_data$allowed_land_uses, useNA = 'ifany')
+full_data = subset(full_data, select = -c(allowed_land_uses))
+```
+
+#### Story_typeid
+```{r, message=FALSE, warning=FALSE}
+full_data <- full_data %>% mutate(story_typeid = as.factor(story_typeid))
+levels8 <- levels(full_data$story_typeid)
+levels8[length(levels) + 1] <- "NO"
+full_data$story_typeid <- factor(full_data$story_typeid, levels = levels8)
+full_data$story_typeid[is.na(full_data$story_typeid)] <- "NO"
+```
+
+#### Patio_in_yard
+Esta variable significa tipo de patio que posee, por lo que con los NA´s se crea un tipo adicional llamado another.
+```{r}
+full_data <- full_data %>% mutate(patio_in_yard = as.factor(patio_in_yard))
+levels9 <- levels(full_data$patio_in_yard)
+levels9[length(levels) + 1] <- "ANOTHER"
+full_data$patio_in_yard <- factor(full_data$patio_in_yard, levels = levels9)
+full_data$patio_in_yard[is.na(full_data$patio_in_yard)] <- "ANOTHER"
+```
+
+#### Number_stories
+Número de historias o niveles que tiene la casa, se crea una categoría adicional con los Na´s
+```{r}
+full_data <- full_data %>% mutate(number_stories = as.factor(number_stories))
+levels10 <- levels(full_data$number_stories)
+levels10[length(levels) + 1] <- "ANOTHER"
+full_data$number_stories <- factor(full_data$number_stories, levels = levels10)
+full_data$number_stories[is.na(full_data$number_stories)] <- "ANOTHER"
+```
+Después de los NA´s del que más existen es del tipo 1 que es ático y sótano y del tipo 2 que es ático
+
+#### Tax_assessment_year
+```{r}
+full_data <- full_data %>% mutate(tax_assessment_year = as.factor(tax_assessment_year))
+```
+Posee 2 niveles o 2015 o 2016.
+
+##### Raw_census__and_blockid_1
+Esta variable que aparece 2 veces y en principio son identicas, para ello cogemos un par de valores aleatorios y observamos si coinciden :raw_census__and_blockid_1 y raw_census__and_blockid_2 
+```{r eval=FALSE, include=FALSE}
+unique(full_data$raw_census__and_blockid_1[44635])
+unique(full_data$raw_census__and_blockid_2[44635])
+unique(full_data$raw_census__and_blockid_1[152736])
+unique(full_data$raw_census__and_blockid_2[152736])
+```
+Efectivamente coinciden y solamente se diferencian en el formato.
+Llevando a cabo un análisis profundo, link[https://www.ffiec.gov/census/Default.aspx]. 
+Finalmente se observa como la variable rawcensusandblock esta compuesta por: 
+- FIPS Code
+-  Number
+- Block Number
+Por lo que se procede a crear 2 columnas llamadas : _number y _block.
+```{r}
+full_data <- full_data %>% mutate(tract_number = as.numeric(str_sub(raw_census__and_blockid_1,5,11)), tract_block =as.numeric(str_sub(raw_census__and_blockid_1,12)))
+```
+Se borra la columna raw_census__and_blockid_2 y se mantiene la 1 , ya que como posteriormente se analizara la importancia de variables de momento no molesta.
+```{r}
+full_data = subset(full_data, select = -c(raw_census__and_blockid_2) )
+```
+Se convierte a factor 
+```{r}
+full_data <- full_data %>% mutate(raw_census__and_blockid_1 = as.numeric(raw_census__and_blockid_1))
+```
+
+#### Architectural_style_typeid y type_construction_typeid
+Dado que contienen 167.888 NA´s, es decir un 100% se eliminan directamente.
+```{r}
+full_data = subset(full_data, select = -c(architectural_style_typeid,  type_construction_typeid) )
+```
+
+#### Number_pools y pool_without_spa.hottub
+Dado que son un conteo y las pocas casas que tienen solo tienen 1 y el resto son muchísimos NA´s se eliminan, porque esta información ya se ha guardado antes con variables lógicas
+```{r}
+full_data = subset(full_data, select = -c(number_pools, pool_without_spa_hottub))
+```
+
+#### Id_parcel
+Para predecir no tiene sentido tener en cuenta la variable identificadora de la parcela ya que es un indicador meramente.
+```{r}
+full_data <- select(full_data, -c(id_parcel))
+```
+
+#### Type_land_use
+Se detecta que es categórica y posee 14 niveles
+```{r}
+full_data <- full_data %>% mutate(type_land_use = as.factor(type_land_use))
+unique(full_data$type_land_use)
+```
+Por ejemplo del tipo que más hay es 261 que es residencia unifamiliar y 266 que es condominio.
+Se puede llevar a cabo el proceso de binarización en muchas de esta variables, pero se dedice saltarnos ese paso ya que por ejemplo, uno de los modelos que vamos a utilizar, por ser unos de los que más se usan actualmente debido a su buen funcionamiento es XGBoost, este modelo busca automáticamente que variables son categóricas y crea internamente las variables dummy correspondientes.
+
+#### Creación de columnas año, mes, día y semana.
+```{r}
+full_data$year_transaction <- as.factor(substr(as.character(full_data$transaction_date), 1, 4))
+full_data$month_transaction <- as.factor(substr(as.character(full_data$transaction_date), 6, 7))
+full_data$day_transaction <- as.factor(substr(as.character(full_data$transaction_date), 9, 10))
+```
+```{r}
+table(full_data$year_transaction, useNA = 'ifany')
+```
+```{r}
+table(full_data$month_transaction, useNA = 'ifany')
+```
+```{r}
+table(full_data$day_transaction, useNA = 'ifany')
+```
+```{r}
+table(full_data$week_transaction, useNA = 'ifany')
+```
+
+### **3.2 Análisis Missing values**
+
+Se decide eliminar las variables que poseen más de un 25% de NA´s ya que consideramos que lo unico que hacen es meterle ruido al modelo y es preferible añadirle variables enriquecidas a través del proceso de ETL.
+
+Junto con el EDA, es básico conocer el número de observaciones disponibles y si todas ellas están completas. Este paso es muy importante ya que algunos algoritmos no aceptan observaciones incompletas o bien se ven muy influenciados por ellas. 
+```{r, echo = TRUE, fig.align='center',  fig.height=15, fig.width=10}
+nulls <- data.frame(col = as.character(colnames(full_data)), 
+                    pct_null = colSums(is.na(full_data))*100/(colSums(is.na(full_data))+colSums(!is.na(full_data))))%>%
+                    filter(col != 'parcelid')
+
+null_count <- ggplot(nulls, aes(x = reorder(col,pct_null), y = pct_null, 
+                                fill = ifelse(pct_null > 25, 'Eliminar','Retener')))+
+  geom_bar(stat = 'identity')+
+  coord_flip()+
+  labs(title = 'Distribución de Missing Data',
+       x = element_blank(), y = 'Porcentaje de Missing Data')+
+  yaztheme::theme_yaz()+theme(legend.position = 'right')+
+  geom_hline(yintercept = 25, linetype = 'dashed')+ theme_minimal() +
+  scale_fill_manual(values = yaz_cols[c(1,6)], name = 'Acción')
+
+null_count
+```
+
+```{r}
+filtrado <- full_data[,colnames(full_data) %in% nulls$col[nulls$pct_null < 25]]
+dim(filtrado)
+```
+
+### **3.4 Correlación de variables cuantitativas**
+Se procede a analizar la correlación existente entre las variables numéricas.
+```{r, echo = TRUE, fig.align='center',  fig.height=10, fig.width=10}
+numericas <- select_if(filtrado,is.numeric)
+corrplot(cor(numericas, use="na.or.complete"), type="lower", number.digits = 5, col =mipaleta, method = "pie" , rect.col = "pink", tl.col ="#021B8A")
+```
+Es importante tener en cuenta que, algunos modelos LM o  GLM se ven perjudicados si incorporan predictores altamente correlacionados.
+
+Se observa como las variables que dan datos relacionados con el baño están muy correlacionadas entre sí, lo cual es obvio ya que están aportando la misma información. También, se observa como están totalmente correlacionadas, finished_living_area y calculated_finished_living_area. Además, también lo están tax_amount, total_tax_assessed_value,assessed_value_built_structure y assessed_value_land_area.
+
+Como era previsible el error no posee correlación con el resto de variables. 
+
+### **3.3 Corrección de variables continuas**
+
+Se lleva acabo un análisis exploratorio a través de los siguientes gráficos para ver su distribución.
+```{r, echo = TRUE, fig.align='center',  fig.height=10, fig.width=10}
+plot_density(
+  data    = filtrado ,
+  ncol    = 3, nrow = 3,
+  ggtheme = theme_minimal(),
+  theme_config = list(
+                  strip.text = element_text(colour = "#D88EF1", size = 12, face = 2)
+                 )
+  )
+```
+Una vez llevada a cabo una limpieza bastante grande de las cualitativas se procede a llevar a cabo una limpieza más exhaustiva  de outliers de las cuantitativas.
+
+Se observa que latitud y longitud no aparecen en el formato correcto, por lo que se modifican.
+```{r}
+filtrado$latitude = filtrado$latitude/1000000
+filtrado$longitude = filtrado$longitude/1000000
+```
+
+### **3.5 Caracteristicas propias de la vivienda**
+
+#### Se comienza con un análisis de los baños de las viviendas 
+```{r}
+bathrooms_related <- select (filtrado,c(calculated_bathroom , number_full_bathrooms,bathroom_cnt ))
+skim(bathrooms_related)
+```
+
+Recordemos que la variable number_full_bathrooms, considera baños completos los que contienen lavabo, ducha + bañera e inodoro. Además dado que las variables calculated_bathroom y bathroom_cnt contienen la misma información que es el nº de baños que posee la vivienda incluyendo los baños fraccionales, se elimina la variable que mayor nº de NA´s posee, es decir calculated_bathroom.
+
+```{r}
+filtrado = subset(filtrado, select = -c(calculated_bathroom))
+```
+Visualizamos los gráficos de caja de las 2 variables para detectar outliers y eliminarlos.
+
+#### Bathroom_cnt
+```{r, fig.align='center'}
+filtrado %>% 
+  ggplot(aes(x=as.factor(bathroom_cnt), y=(log_error), color = bathroom_cnt)) + 
+  geom_jitter(alpha=0.3, color='#99B4E9') +
+  geom_boxplot(outlier.color="#8E60E3", color='#6800FF') + 
+  labs(x='Número de baños', title='Distribución del log error en función del nº de baños')+
+  theme_minimal() 
+```
+En vista de estos resultados se decide solo tener en cuenta las viviendas que poseen 8 baños o menos ya que para el resto apenas existen datos y se considera que se salen de lo establecido como "normal".
+
+#### Number_full_bathrooms
+```{r, fig.align='center'}
+filtrado %>% 
+  ggplot(aes(x=as.factor(number_full_bathrooms), y=(log_error))) + 
+  geom_jitter(alpha=0.3, color='#99B4E9') +
+  geom_boxplot(outlier.color="#8E60E3", color='#6800FF') + 
+  labs(x='Número de baños completos', title ='Distribución del log error en función del nº de baños')+
+  theme_minimal() 
+
+```
+```{r}
+filtrado <- filtrado %>% filter(bathroom_cnt <= 8)
+```
+```{r}
+filtrado <- filtrado %>% filter(number_full_bathrooms <= 8)
+```
+
+Se filtran los que poseen menos de 8 baños.Además, aunque las 2 esten totalmente correlacionadas se decide dejarlas para analizarlas después en las feature importance
+
+#### Número de habitaciones 
+```{r, fig.align='center'}
+filtrado %>% 
+  ggplot(aes(x=as.factor(bedroom_cnt), y=(log_error))) + 
+  geom_jitter(alpha=0.3, color='#99B4E9') +
+  geom_boxplot(outlier.color="#8E60E3", color='#6800FF') + 
+  labs(x='Número de habtiaciones', title='Distribución del log error en función del nº de habitaciones')+
+  theme_minimal() 
+```
+Se eliminan todas aquellas viviendas que posean más de 9 habitaciones 
+```{r}
+filtrado <- filtrado %>% filter(bedroom_cnt <= 9)
+```
+
+#### Número de salas 
+```{r, fig.align='center'}
+filtrado %>% 
+  ggplot(aes(x=as.factor(room_cnt), y=(log_error))) + 
+  geom_jitter(alpha=0.3, color='#99B4E9') +
+  geom_boxplot(outlier.color="#8E60E3", color='#6800FF') + 
+  labs(x='Número de salas', title='Distribución del log error en función del nº de salas')+
+  theme_minimal() 
+```
+Se decide filtrar a partir de 11 habitaciones y se asume que tiene sentido que existan 0 salas, en los loft. 
+```{r}
+filtrado <- filtrado %>% filter(room_cnt <= 11)
+```
+
+#### Pies zonas habitables
+También se observa como estan totalmente correlacionadas las variables finished_living_area y calculated_finished_living_area.
+```{r}
+living_area <- select(filtrado,c(finished_living_area, calculated_finished_living_area))
+skim(living_area)
+```
+Dado que significan lo mismo y la variable finished_living_area posee muchos más NA´s se decide eliminarla
+```{r}
+filtrado = subset(filtrado, select = -c(finished_living_area) )
+```
+Tras hacer un análisis exploratorio a través de internet se estima que de media en EEUU una vivienda posee 2000 feets, por lo que tiene sentido el siguiente resultado. 
+```{r}
+skim(filtrado$calculated_finished_living_area)
+```
+
+```{r, fig.align='center'}
+filtrado %>% 
+  ggplot(aes(x=as.factor(calculated_finished_living_area), y=(log_error))) + 
+  geom_jitter(alpha=0.3, color='#99B4E9') +
+  geom_boxplot(outlier.color="#8E60E3", color='#6800FF') + 
+  labs(x='Número de salas', title='Distribución del log error en función del area habitable')+
+  theme_minimal() 
+```
+Se estima como minimo 200 feets apra una vivienda y como máximo 10.000 feets
+```{r}
+filtrado <- filtrado %>% filter(calculated_finished_living_area >= 200, calculated_finished_living_area < 10000)
+```
+A continuación, se analiza la siguiente variable relacionada con el área por metros cuadrados llamada lot_size_square_feet
+```{r}
+skim(filtrado$lot_size_square_feet)
+```
+
+Esta variable significa pies totales de la parcela dado que se estima que puede existir entorno a un doble en la parcela que en la vivineda en sí se establecen lo limites con concordacia a ello. Además, posee muchos NA´s por lo que se decide eliminar dichas observaciones.
+```{r}
+filtrado = filtrado [!is.na(filtrado$lot_size_square_feet),]
+filtrado <- filtrado %>% filter(lot_size_square_feet >= 400, lot_size_square_feet <= 20000)
+```
+
+### **3.6 Variables relacionadas con los impuestos**
+
+```{r}
+tax_variables <- select (filtrado,c(total_tax_assessed_value, assessed_value_built_structure,assessed_value_land_area, tax_amount))
+skim(tax_variables)
+```
+
+En función de los cuartiles se filtran para evitar outliers y se eliminan los NA´s.
+
+#### Total_tax_assessed_value
+Esta variable es el impuesto total a la propiedad evaluado para ese año de evaluación. Se establece el limite el 1 millón
+```{r}
+filtrado = filtrado [!is.na(filtrado$total_tax_assessed_value),]
+filtrado <- filtrado %>% filter(total_tax_assessed_value <= 2000000)  
+```
+
+```{r}
+filtrado %>% 
+  ggplot(aes(x=total_tax_assessed_value)) + 
+  geom_histogram(bins=400, fill="#CF77D2", color='#77BFD2')+
+  theme_minimal() 
+```
+
+#### Assessed_value_built_structure
+Esta variable es el valor evaluado de la estructura construida en la parcela.
+```{r}
+filtrado = filtrado [!is.na(filtrado$assessed_value_built_structure),]
+filtrado <- filtrado %>% filter(assessed_value_built_structure <= 500000)  
+```
+```{r}
+filtrado %>% 
+  ggplot(aes(x=assessed_value_built_structure)) + 
+  geom_histogram(bins=400, fill="#CF77D2", color='#77BFD2')+
+  theme_minimal() 
+```
+
+#### Assessed_value_land_area               
+Es similar a la anterior en este caso es el valor evaluado de la superficie de la parcela.
+```{r}
+filtrado = filtrado [!is.na(filtrado$assessed_value_land_area),]
+filtrado <- filtrado %>% filter(assessed_value_land_area <= 700000)  
+skim(filtrado$assessed_value_land_area)
+```
+```{r}
+filtrado %>% 
+  ggplot(aes(x=assessed_value_land_area)) + 
+  geom_histogram(bins=400, fill="#CF77D2", color='#77BFD2')+
+  theme_minimal() 
+```
+
+#### Tax_amount
+```{r}
+filtrado = filtrado [!is.na(filtrado$tax_amount),]
+filtrado <- filtrado %>% filter(tax_amount <= 10000)  
+```
+```{r}
+filtrado %>% 
+  ggplot(aes(x=tax_amount)) + 
+  geom_histogram(bins=400, fill="#CF77D2", color='#77BFD2')+
+  theme_minimal() 
+```
+
+### **3.7 Análisis de la distribución de la variable target: log error**
+
+#### Distribución del error
+```{r, fig.align='center'}
+full_data %>% 
+  ggplot(aes(x=log_error)) + 
+  geom_histogram(bins=400, fill="#DEA1E0")+
+  theme_bw()+theme(axis.title = element_text(size=16),axis.text = element_text(size=14))+
+  ylab("Count")+coord_cartesian(x=c(-0.5,0.5))+ 
+  labs(title = "Distribución del log error")+
+  theme_minimal() 
+```
+Se aprecia como está infravalorando y sobrevalorando de igual manera, es decir se puede afirmar que la variable target posee una distribución simétrica.
+
+#### Distribución del log error a lo largo del tiempo
+```{r}
+skim(filtrado$transaction_date)
+```
+
+Es decir por cada fecha hay varias observaciones y en total existen 602 fechas.
+Hay que tener en cuenta que para el rango que estábamos utilizando existen un total de 634 días por lo que al eliminar observaciones se asume que hemos borrado datos para 32 días.
+
+#### Distribución de la media del error a lo largo del tiempo 
+```{r, fig.align='center'}
+transactions <- select (filtrado,c(transaction_date, log_error))
+transactions[, "transaction_date"] <- as.character(transactions$transaction_date)
+transactions$month <- sapply(strsplit(transactions$transaction_date, "-"), function(x) x[2])
+
+transactions %>% 
+  mutate(year_month = make_date(year=year(transaction_date),month=month(transaction_date)) ) %>% 
+  group_by(year_month) %>% summarize(mean_log_error = mean(log_error)) %>% 
+  ggplot(aes(x=year_month,y=mean_log_error)) + 
+  geom_line(size=1, color="#DEA1E0")+geom_point(size=2, color="darkmagenta")+theme_minimal()
+```
+En este gráfico se observa como en el último tramo del dataset la tendencia es alcista, se adelanta que como dataset de set se utilizarán los 3 últimos meses de 2017.
+
+Se analiza si existe relación con el número de transacciones llevadas a cabo en esas fechas:
+```{r, fig.align='center', warning=FALSE, message=FALSE}
+tmp <- transactions %>% mutate(year_month = make_date(year=year(transaction_date),month=month(transaction_date)))
+tmp
+tmp %>% 
+  group_by(year_month) %>% count() %>% 
+  ggplot(aes(x=year_month,y=n)) +
+  geom_bar(stat="identity", fill="#DEA1E0") +
+  theme_minimal()
+```
+
+Ya se demostró anteriormente que el log error no posee correlación con ninguna variable, pero con las que sí que poseía un poco de correlación se procede a analizar si pudieran cuadrar sus distribuciones.
+```{r}
+custom_corr_plot <- function(variable1, variable2, df, alpha=0.3){
+  p <- df %>%
+       mutate(
+         # Truco para que se ponga el título estilo facet
+        title = paste(toupper(variable2), "vs", toupper(variable1))
+       ) %>%
+       ggplot(aes(x = !!sym(variable1), y = !!sym(variable2))) + 
+       geom_point(alpha = alpha) +
+       # Tendencia no lineal
+       geom_smooth(se = FALSE, method = "gam", formula =  y ~ splines::bs(x, 3)) +
+       # Tendencia lineal
+       geom_smooth(se = FALSE, method = "lm", color = "firebrick") +
+       facet_grid(. ~ title) +
+       theme_bw() +
+       theme(strip.text = element_text(colour = "black", size = 10, face = 2),
+             axis.title = element_blank())
+  return(p)
+}
+```
+
+Se seleccionan las variables que estaban un poco más correladas con el log error aunque como vimos ninguna lo estaba.
+```{r, warning= FALSE, message = FALSE}
+variables_continuas <- c("bedroom_cnt", "bathroom_cnt")
+
+plots <- map(
+            .x = variables_continuas,
+            .f = custom_corr_plot,
+            variable2 = "log_error",
+            df = filtrado
+         )
+
+ggarrange(plotlist = plots, ncol = 2, nrow = 1) %>%
+  annotate_figure(
+    top = text_grob("Correlación", face = "bold", size = 12,
+                    x = 0.4)
+  )
+```
+
+No tiene mucho sentido porque no están nada correladas.
+Se seleccionan otras 2 relacionadas con el área habitable para demostrar que tampoco lo están
+```{r, warning= FALSE, message = FALSE}
+variables_continuas <- c("calculated_finished_living_area", "lot_size_square_feet")
+
+plots <- map(
+            .x = variables_continuas,
+            .f = custom_corr_plot,
+            variable2 = "log_error",
+            df = filtrado
+         )
+
+ggarrange(plotlist = plots, ncol = 2, nrow = 1) %>%
+  annotate_figure(
+    top = text_grob("Correlación", face = "bold", size = 12,
+                    x = 0.4)
+  )
+```
+
+### **3.8 Construcción de pisos**
+```{r, fig.align='center', , warning= FALSE, message = FALSE}
+filtrado %>% 
+  ggplot(aes(x=year_built))+geom_line(stat="density", color="#DEA1E0", size=1.2)+theme_minimal()
+```
+Se aprecia como la mayoría de las viviendas de este dataset fueron construidas entorno al año 1950
+
+Se analiza como varia el error en función del año en el que se construyo, en primer lugar con respecto al error absoluto 
+```{r, fig.align='center', , warning= FALSE, message = FALSE}
+filtrado %>% 
+  group_by(year_built) %>% 
+  summarize(mean_abs_logerror = mean(abs(log_error)),n()) %>% 
+  ggplot(aes(x=year_built,y=mean_abs_logerror))+
+  geom_smooth(color="grey40")+
+  geom_point(color="darkorchid1")+coord_cartesian(ylim=c(0,0.25))+theme_bw()
+```
+Se ve como las predicciones de viviendas construidas anteriormente a 1910 el error no estima de manera adecuada, en concreto tiende a infravalorar las viviendas, por lo que tal vez seria buena eliminar esas viviendas 
+
+Con respecto al error medio:
+```{r, fig.align='center', , warning= FALSE, message = FALSE}
+filtrado %>% 
+  group_by(year_built) %>% 
+  summarize(mean_logerror = mean(log_error),n()) %>% 
+  ggplot(aes(x=year_built,y=mean_logerror))+
+  geom_smooth(color="grey40")+
+  geom_point(color="darkorchid1")+coord_cartesian(ylim=c(0,0.25))+theme_bw()
+```
+Con respecto al error medio se observa que especialmente son las que se construyeron antes del 1900, y en concreto existe un outlier que se construyó en 1750, por lo que se decide eliminar esas observaciones.
+
+```{r}
+filtrado = filtrado [!is.na(filtrado$year_built),]
+filtrado <- filtrado %>% filter(year_built >= 1900)  
+```
+
+### **3.9 Análisis de variables relacionadas con la geolocalización**
+```{r}
+geolocation <- select (filtrado,c(longitude, latitude, id_county, id_city, id_zip, tract_block, tract_number))
+skim(geolocation)
+```
+
+```{r}
+unique(filtrado$id_county)
+```
+Se observa que existen 3 identificadores de condando:
+3101: Los Angeles
+1266: Orange
+2061: Ventura
+Lo utilizaremos para segmentar nuestros modelos.
+```{r, fig.align='center'}
+filtrado %>% 
+  ggplot(aes(x=as.factor(id_county), y=(log_error), color = id_county)) + 
+  geom_jitter(alpha=0.3, color='#99B4E9') +
+  geom_boxplot(outlier.color="#8E60E3", color='#6800FF') + 
+  labs(x='Counties', title ='Distribución del log error en función del condado')+
+  theme_minimal() 
+```
+Se aprecia como el que más dispersión del error posee es el condado de los Estados Unidos.
+
+Se eliminan las observaciones para las que no existe valor en id_city e id_zip
+```{r}
+filtrado = filtrado [!is.na(filtrado$id_city),]
+filtrado = filtrado [!is.na(filtrado$id_zip),]
+```
+
+##### Análisis longitud y latitud
+
+**Latitud**
+```{r, fig.align='center', , warning= FALSE, message = FALSE}
+tmptrans <- filtrado %>% mutate(overunder = ifelse(log_error<0,"under","over"))
+tmptrans %>% ggplot(aes(x=latitude,y=(log_error),color=overunder))+geom_smooth()+theme_bw()+scale_color_brewer(palette="Set3")
+```
+
+**Longitud**
+```{r, fig.align='center', , warning= FALSE, message = FALSE}
+tmptrans %>% ggplot(aes(x=longitude,y=(log_error), color=overunder))+geom_smooth()+theme_bw()+scale_color_brewer(palette="Set3")
+```
+
+##### Se seleccionan las coordendas en las que es error esta sobreestimando y subestimando para dibujar un cuadrado de la localización
+```{r, echo = TRUE, fig.align='center',  fig.height=15, fig.width=10}
+leaflet() %>% 
+addTiles() %>% 
+  fitBounds(-118.5,33.8,-118.25,34.15) %>% 
+  addRectangles(-118.5,33.8,-118.25,34.15) %>% 
+  addMiniMap()
+```
+
+##### Localización en función del error para ver si hay zonas localizadas que poseean un mayor error
+```{r, echo = TRUE, fig.align='center',  fig.height=15, fig.width=10, , warning= FALSE, message = FALSE}
+tmp <- full_data_original %>% select(id_parcel, longitude, latitude, log_error)
+qpal <- colorQuantile("PuRd", tmp$log_error, n = 7)
+leaflet(tmp) %>% 
+  addTiles() %>% 
+  addCircleMarkers(stroke=FALSE, color=~qpal(log_error),fillOpacity = 1) %>% 
+  addLegend("bottomright", pal = qpal, values = ~log_error,title = "Log error",opacity = 1) %>% 
+   addMiniMap()
+```
+
+### **3.10 Análisis de variables con varianza próxima a 0**
+
+No es conveniente incluir en los modelos variables predictoras que posean una varianza próxima a cero, es decir, predictores que toman solo unos pocos valores, de los cuales, algunos aparecen con muy poca frecuencia. 
+La función nearZeroVar() del paquete caret identifica como predictores potencialmente problemáticos aquellos que tienen un único valor (cero varianza) o que cumplen las dos siguientes condiciones:
+
+* Ratio de frecuencias: ratio entre la frecuencia del valor más común y la frecuencia del segundo valor más común. Este ratio tiende a 1 si las frecuencias están equidistribuidas y a valores grandes cuando la frecuencia del valor mayoritario supera por mucho al resto (el denominador es un número decimal pequeño). Valor por defecto freqCut = 95/5.
+
+* Porcentaje de valores únicos: número de valores únicos dividido entre el total de muestras (multiplicado por 100). Este porcentaje se aproxima a cero cuanto mayor es la variedad de valores. Valor por defecto uniqueCut = 10.
+```{r}
+varianza <- nearZeroVar(filtrado, saveMetrics = TRUE)
+```
+Columnas a eliminar
+```{r}
+drop_columns <- rownames(varianza)[varianza$nzv == TRUE]
+drop_columns
+```
+Se seleccionan las variables que no están en la lista
+```{r}
+filtrado <- filtrado[, !names(filtrado) %in% drop_columns]
+```
+
+### **3.11 Visualización del dataset limpio**
+
+Se visualiza un resumen final de las variables con las que nos hemos quedado
+```{r}
+skim(filtrado)
+```
+Finalmente se guardan los datos limpios en csv para poder generar los modelos 
+```{r}
+#write.csv(filtrado, "Datos_limpios_05_05_2020.csv")
+```
+
+# **4. Modelos**
+Se decide crear 2 modelos muy similares entre sí para llevar a cabo una comparativa: GBM y XGBoost.
+
+Tanto XGBoost como GBM siguen el principio del aumento de gradiente. La diferencia principal entre estos dos modelos de predicción es que XGBoost utiliza una formalización del modelo más regularizada para controlar el sobreajuste, lo que le proporciona un mejor rendimiento.
+Otra de las grandes diferencias entre estos dos modelos es el rendimiento, ya que con XGBoost se han realizado una gran cantidad de mejoras de rendimiento en diferentes partes de la implementación que hacen que haya una gran diferencia entre velocidad y utilización de memoria, ya que usa matrices dispersas con algoritmos de dispersión, estructuras de datos mejoradas para una utilización más eficiente de la memoria caché del procesador, lo que lo hace más rápido; y un mejor soporte multinúcleo que reduce el tiempo de entrenamiento.
+
+### **4.1 GBM Gradient Boosting Machine**
+
+#### GBM Gradient Boosting Machine
+
+Boosting Machine (BM) es un tipo de modelo obtenido al combinar (ensembling) múltiples modelos sencillos, también conocidos como weak learners. Está combinación se realiza de manera secuencial de tal forma que, cada nuevo modelo que se incorpora al conjunto, intenta corregir los errores de los anteriores modelos. Como resultado de la combinación de múltiples modelos, Boosting Machine consigue aprender relaciones no lineales entre la variable respuesta y los predictores. Si bien los modelos combinados pueden ser muy variados, H2O, al igual que la mayoría de librerías, utiliza como weak learners modelos basados en árboles.
+
+Gradient Boosting Machine (GBM) es una generalización del modelo de Boosting Machine que permite aplicar el método de descenso de gradiente para optimizar cualquier función de coste durante el ajuste del modelo.
+
+El valor predicho por un modelo GBM es la agregación (normalmente la moda en problemas de clasificación y la media en problemas de regresión) de las predicciones de todos los modelos individuales que forman el ensemble.
+
+Dado que el ajuste de los weak learners que forman un GBM se hace de forma secuencial (el árbol i se ajusta a partir de los resultados del árbol i-1), las posibilidades de paralelizar el algoritmo son limitadas. H2O consigue acelerar el proceso en cierta medida paralelizando el ajuste de los árboles individuales.
+
+Utilizamos H2O porque aunque los comandos se ejecuten desde R, los datos se encuentran en el cluster de H2O, no en memoria. Por lo que hace que se solventen los problemas relacionados con la memoria al tener más de 100.000 variables.
+
+Parada temprana: H2O incorpora criterios de parada para que no se continúe mejorando un modelo si ya se ha alcanzado una solución aceptable. Dependiendo del algoritmo, el criterio de parada es distinto. 
+
+También hay que remarcar que el proceso de EDA y selección también se podría haber llevado a cabo con H2O pero para el tamaño del dataset generado no ha sido necesario.
+
+http://localhost:54321/flow/index.html
+
+```{r, message = FALSE, warning=FALSE}
+filtrado <- read_csv('Datos_limpios_05_05_2020.csv')
+filtrado = subset(filtrado, select = -c(transaction_date) )
+filtrado = subset(filtrado, select = -c(X1))
+filtrado$air_conditioning_typeid <- as.factor(filtrado$air_conditioning_typeid)
+filtrado$building_quality_typeid <- as.factor(filtrado$building_quality_typeid)
+filtrado$number_fireplaces <- as.factor(filtrado$number_fireplaces)
+filtrado$number_garages <- as.factor(filtrado$number_garages)
+filtrado$type_heating_system <- as.factor(filtrado$type_heating_system)
+filtrado$number_stories <- as.factor(filtrado$number_stories)
+filtrado$month_transaction <- as.factor(filtrado$month_transaction)
+filtrado$day_transaction <- as.factor(filtrado$day_transaction)
+filtrado$federal_information_processing <- as.factor(filtrado$federal_information_processing)
+filtrado$type_land_use <- as.factor(filtrado$type_land_use)
+filtrado$day_transaction <- as.factor(filtrado$day_transaction)
+filtrado$tax_assessment_year <- as.factor(filtrado$tax_assessment_year)
+filtrado$year_transaction <- as.factor(filtrado$year_transaction)
+angeles <- filtrado %>% filter(id_county == 3101)
+orange_ventura <- filtrado %>% filter(id_county == 1286 | id_county == 2061)
+angeles = subset(angeles, select = -c(id_county))
+orange_ventura = subset(orange_ventura, select = -c(id_county))
+```
+
+Creación de un cluster local con todos los cores disponibles.
+```{r, message = FALSE, warning=FALSE}
+h2o.init(ip = "localhost",
+         # -1 indica que se empleen todos los cores disponibles.
+         nthreads = -1,
+         # Máxima memoria disponible para el cluster.
+         max_mem_size = "32g")
+```
+
+#### Condandos Ventura y Orange
+
+Se eliminan los datos del cluster por si ya había sido iniciado
+```{r, message = FALSE, warning=FALSE}
+h2o.removeAll()
+h2o.no_progress()
+datos_h2o <- as.h2o(x = orange_ventura, destination_frame = "datos_h2o")
+```
+
+La función h2o.splitFrame() realiza particiones aleatorias
+```{r, message = FALSE, warning=FALSE}
+set.seed(123)
+particiones     <- h2o.splitFrame(data = datos_h2o, ratios = c(0.8), seed = 123)
+datos_train_h2o <- h2o.assign(data = particiones[[1]], key = "datos_train_h2o")
+datos_test_h2o  <- h2o.assign(data = particiones[[2]], key = "datos_test_h2o")
+datos_train <- as.data.frame(datos_train_h2o)
+datos_test  <- as.data.frame(datos_test_h2o)
+```
+Datos balanceados
+```{r, message = FALSE, warning=FALSE}
+summary(datos_train$log_error)
+summary(datos_test$log_error)
+```
+Se define la variable respuesta y los predictores.
+```{r, message = FALSE, warning=FALSE}
+var_respuesta <- "log_error"
+predictores <- setdiff(h2o.colnames(datos_train_h2o), var_respuesta)
+```
+Optimización de hiperparámetros para el entrenamiento
+```{r, message = FALSE, warning=FALSE}
+hiperparametros <- list(
+  ntrees      = c(500, 1000, 2000),
+  learn_rate  = seq(0.01, 0.1, 0.01),
+  max_depth   = seq(2, 15, 1),
+  sample_rate = seq(0.5, 1.0, 0.2),
+  col_sample_rate = seq(0.1, 1.0, 0.3))
+
+# Criterios de parada para la búsqueda
+search_criteria <- list(
+  strategy = "RandomDiscrete",
+  max_models = 50, # Número máximo de combinaciones
+  max_runtime_secs = 60*10, # Tiempo máximo de búsqueda
+  stopping_tolerance = 0.001, # Mejora mínima
+  stopping_rounds = 5,
+  seed = 123)
+
+grid_gbm <- h2o.grid(
+  # Algoritmo y parámetros
+  algorithm = "gbm",
+  distribution = "gaussian",
+  # Variable respuesta y predictores
+  y = var_respuesta,
+  x = predictores,
+  # Datos de entrenamiento
+  training_frame = datos_train_h2o,
+  # Preprocesado
+  ignore_const_cols = TRUE,
+  # Parada temprana
+  score_tree_interval = 100,
+  stopping_rounds = 3,
+  stopping_metric = "rmse",
+  stopping_tolerance = 0.01,
+  # Hiperparámetros optimizados
+  hyper_params = hiperparametros,
+  # Estrategia de validación para seleccionar el mejor modelo
+  seed   = 123,
+  nfolds = 3,
+  # Tipo de búsqueda
+  search_criteria = search_criteria,
+  keep_cross_validation_predictions = TRUE,
+  grid_id         = "grid_gbm")
+```
+
+Se muestran los modelos ordenados de mayor a menor rmse
+```{r, message = FALSE, warning=FALSE}
+resultados_grid_gbm <- h2o.getGrid(
+  grid_id = "grid_gbm",
+  sort_by = "rmse",
+  decreasing = FALSE)
+#as.data.frame(resultados_grid_gbm@summary_table)
+```
+
+Se reentrena el modelo con los mejores hiperparámetros
+```{r, message = FALSE, warning=FALSE}
+mejores_hiperparam <- h2o.getModel(resultados_grid_gbm@model_ids[[1]])@parameters
+
+modelo_gbm <- h2o.gbm(
+  # Variable respuesta y predictores
+  y = var_respuesta,
+  x = predictores,
+  # Datos de entrenamiento
+  training_frame = datos_train_h2o,
+  # Preprocesado
+  ignore_const_cols = TRUE,
+  # Hiperparámetros
+  learn_rate  = mejores_hiperparam$learn_rate,
+  max_depth   = mejores_hiperparam$max_depth,
+  ntrees      =  mejores_hiperparam$ntrees,
+  sample_rate = mejores_hiperparam$sample_rate,
+  # Estrategia de validación (para comparar modelos)
+  seed            = 123,
+  nfolds          = 10,
+  keep_cross_validation_predictions = TRUE,
+  model_id        = "modelo_gbm")
+```
+
+Importancia predictores
+```{r, message = FALSE, warning=FALSE,fig.align='center'}
+h2o.varimp(modelo_gbm)
+h2o.varimp_plot(modelo_gbm)
+```
+
+Gráficos pdp
+```{r, message = FALSE, warning=FALSE,fig.align='center'}
+par(mfrow = c(3, 2))
+pdp_plots <- h2o.partialPlot(
+  object = modelo_gbm,
+  data   = datos_train_h2o,
+  cols   = predictores,
+  nbins  = 31,
+  plot   = TRUE,
+  plot_stddev = TRUE)
+```
+
+Diagnostico de residuos de entrenamiento 
+```{r, message = FALSE, warning=FALSE, fig.align='center'}
+predicciones_train <- h2o.predict(
+  modelo_gbm,
+  newdata = datos_train_h2o)
+predicciones_train <- h2o.cbind(
+  datos_train_h2o["log_error"],
+  predicciones_train)
+predicciones_train <- as.data.frame(predicciones_train)
+predicciones_train <- predicciones_train %>%
+  mutate(residuo = predict - log_error)
+
+p1 <- ggplot(predicciones_train, aes(x = log_error, y  = predict)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "gam", color = "red", size = 1, se = FALSE) +
+  labs(title = "Predicciones vs valor real") +
+  theme_bw()
+
+p2 <- ggplot(predicciones_train, aes(1:nrow(predicciones_train), y  = residuo)) +
+  geom_point(alpha = 0.1) +
+  geom_hline(yintercept = 0, color = "red", size = 1) +
+  labs(title = "Residuos del modelo") +
+  theme_bw()
+
+p3 <- ggplot(predicciones_train, aes(x  = residuo)) +
+  geom_density() +
+  geom_rug() +
+  labs(title = "Residuos del modelo") +
+  theme_bw()
+
+p4 <- ggplot(predicciones_train, aes(sample  = predict)) +
+  stat_qq() +
+  stat_qq_line(color = "red", size = 1) +
+  labs(title = "QQ-plot residuos del modelo") +
+  theme_bw()
+
+ggpubr::ggarrange(p1, p2, p3, p4, ncol = 2, nrow = 2) %>%
+  ggpubr::annotate_figure(
+    top = ggpubr::text_grob("Diagnóstico residuos entrenamiento",
+                            color = "black", face = "bold", size = 14))
+```
+Predicción
+```{r, message = FALSE, warning=FALSE}
+predicciones_test <- h2o.predict(object  = modelo_gbm, newdata = datos_test_h2o)
+predicciones_test <- as.vector(predicciones_test)
+datos_test$prediccion <- predicciones_test
+rmse_test_gbm <- MLmetrics::RMSE( y_pred = datos_test$log_error, y_true = datos_test$prediccion)
+mse_test_gbm <- MLmetrics::MSE( y_pred = datos_test$log_error, y_true = datos_test$prediccion)
+MAE_test_gbm <- MLmetrics::MAE(y_pred = datos_test$log_error,y_true = datos_test$prediccion)
+MedianAE_test_gbm <- MLmetrics::MedianAE(y_pred = datos_test$log_error,y_true = datos_test$prediccion)
+```
+
+```{r, message = FALSE, warning=FALSE}
+paste("Error de test (RMSE) del modelo GBM:", rmse_test_gbm)
+paste("Error de test (MSE) del modelo GBM:", mse_test_gbm)
+paste("Error de test (MAE) del modelo GBM:", MAE_test_gbm)
+paste("Error de test (MedianAE) del modelo GBM:", MedianAE_test_gbm)
+```
+
+#### Condando Los Angeles
+
+Se eliminan los datos del cluster por si ya había sido iniciado
+```{r, message = FALSE, warning=FALSE}
+h2o.removeAll()
+h2o.no_progress()
+datos_h2o <- as.h2o(x = angeles, destination_frame = "datos_h2o")
+```
+
+La función h2o.splitFrame() realiza particiones aleatorias
+```{r, message = FALSE, warning=FALSE}
+set.seed(123)
+particiones     <- h2o.splitFrame(data = datos_h2o, ratios = c(0.8), seed = 123)
+datos_train_h2o <- h2o.assign(data = particiones[[1]], key = "datos_train_h2o")
+datos_test_h2o  <- h2o.assign(data = particiones[[2]], key = "datos_test_h2o")
+datos_train <- as.data.frame(datos_train_h2o)
+datos_test  <- as.data.frame(datos_test_h2o)
+```
+Datos balanceados
+```{r, message = FALSE, warning=FALSE}
+summary(datos_train$log_error)
+summary(datos_test$log_error)
+```
+Se define la variable respuesta y los predictores.
+```{r, message = FALSE, warning=FALSE}
+var_respuesta <- "log_error"
+predictores <- setdiff(h2o.colnames(datos_train_h2o), var_respuesta)
+```
+Optimización de hiperparámetros para el entrenamiento
+```{r, message = FALSE, warning=FALSE}
+hiperparametros <- list(
+  ntrees      = c(500, 1000, 2000),
+  learn_rate  = seq(0.01, 0.1, 0.01),
+  max_depth   = seq(2, 15, 1),
+  sample_rate = seq(0.5, 1.0, 0.2),
+  col_sample_rate = seq(0.1, 1.0, 0.3))
+
+# Criterios de parada para la búsqueda
+search_criteria <- list(
+  strategy = "RandomDiscrete",
+  max_models = 50, # Número máximo de combinaciones
+  max_runtime_secs = 60*10, # Tiempo máximo de búsqueda
+  stopping_tolerance = 0.001, # Mejora mínima
+  stopping_rounds = 5,
+  seed = 123)
+
+grid_gbm <- h2o.grid(
+  # Algoritmo y parámetros
+  algorithm = "gbm",
+  distribution = "gaussian",
+  # Variable respuesta y predictores
+  y = var_respuesta,
+  x = predictores,
+  # Datos de entrenamiento
+  training_frame = datos_train_h2o,
+  # Preprocesado
+  ignore_const_cols = TRUE,
+  # Parada temprana
+  score_tree_interval = 100,
+  stopping_rounds = 3,
+  stopping_metric = "rmse",
+  stopping_tolerance = 0.01,
+  # Hiperparámetros optimizados
+  hyper_params = hiperparametros,
+  # Estrategia de validación para seleccionar el mejor modelo
+  seed   = 123,
+  nfolds = 3,
+  # Tipo de búsqueda
+  search_criteria = search_criteria,
+  keep_cross_validation_predictions = TRUE,
+  grid_id         = "grid_gbm")
+```
+
+Se muestran los modelos ordenados de mayor a menor rmse
+```{r, message = FALSE, warning=FALSE}
+resultados_grid_gbm <- h2o.getGrid(
+  grid_id = "grid_gbm",
+  sort_by = "rmse",
+  decreasing = FALSE)
+#as.data.frame(resultados_grid_gbm@summary_table)
+```
+
+Se reentrena el modelo con los mejores hiperparámetros
+```{r, message = FALSE, warning=FALSE}
+mejores_hiperparam <- h2o.getModel(resultados_grid_gbm@model_ids[[1]])@parameters
+
+modelo_gbm <- h2o.gbm(
+  # Variable respuesta y predictores
+  y = var_respuesta,
+  x = predictores,
+  # Datos de entrenamiento
+  training_frame = datos_train_h2o,
+  # Preprocesado
+  ignore_const_cols = TRUE,
+  # Hiperparámetros
+  learn_rate  = mejores_hiperparam$learn_rate,
+  max_depth   = mejores_hiperparam$max_depth,
+  ntrees      =  mejores_hiperparam$ntrees,
+  sample_rate = mejores_hiperparam$sample_rate,
+  # Estrategia de validación (para comparar modelos)
+  seed            = 123,
+  nfolds          = 10,
+  keep_cross_validation_predictions = TRUE,
+  model_id        = "modelo_gbm")
+```
+
+Importancia predictores
+```{r, message = FALSE, warning=FALSE, fig.align='center'}
+h2o.varimp(modelo_gbm)
+h2o.varimp_plot(modelo_gbm)
+```
+
+Gráficos pdp
+```{r, message = FALSE, warning=FALSE, fig.align='center'}
+par(mfrow = c(3, 2))
+pdp_plots <- h2o.partialPlot(
+  object = modelo_gbm,
+  data   = datos_train_h2o,
+  cols   = predictores,
+  nbins  = 31,
+  plot   = TRUE,
+  plot_stddev = TRUE)
+```
+
+Diagnostico de residuos de entrenamiento 
+```{r, message = FALSE, warning=FALSE, fig.align='center'}
+predicciones_train <- h2o.predict(
+  modelo_gbm,
+  newdata = datos_train_h2o)
+predicciones_train <- h2o.cbind(
+  datos_train_h2o["log_error"],
+  predicciones_train)
+predicciones_train <- as.data.frame(predicciones_train)
+predicciones_train <- predicciones_train %>%
+  mutate(residuo = predict - log_error)
+
+p1 <- ggplot(predicciones_train, aes(x = log_error, y  = predict)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "gam", color = "red", size = 1, se = FALSE) +
+  labs(title = "Predicciones vs valor real") +
+  theme_bw()
+
+p2 <- ggplot(predicciones_train, aes(1:nrow(predicciones_train), y  = residuo)) +
+  geom_point(alpha = 0.1) +
+  geom_hline(yintercept = 0, color = "red", size = 1) +
+  labs(title = "Residuos del modelo") +
+  theme_bw()
+
+p3 <- ggplot(predicciones_train, aes(x  = residuo)) +
+  geom_density() +
+  geom_rug() +
+  labs(title = "Residuos del modelo") +
+  theme_bw()
+
+p4 <- ggplot(predicciones_train, aes(sample  = predict)) +
+  stat_qq() +
+  stat_qq_line(color = "red", size = 1) +
+  labs(title = "QQ-plot residuos del modelo") +
+  theme_bw()
+
+ggpubr::ggarrange(p1, p2, p3, p4, ncol = 2, nrow = 2) %>%
+  ggpubr::annotate_figure(
+    top = ggpubr::text_grob("Diagnóstico residuos entrenamiento",
+                            color = "black", face = "bold", size = 14))
+```
+
+```{r, message = FALSE, warning=FALSE}
+predicciones_test <- h2o.predict(object  = modelo_gbm, newdata = datos_test_h2o)
+predicciones_test <- as.vector(predicciones_test)
+datos_test$prediccion <- predicciones_test
+rmse_test_gbm <- MLmetrics::RMSE( y_pred = datos_test$log_error, y_true = datos_test$prediccion)
+mse_test_gbm <- MLmetrics::MSE( y_pred = datos_test$log_error, y_true = datos_test$prediccion)
+MAE_test_gbm <- MLmetrics::MAE(y_pred = datos_test$log_error,y_true = datos_test$prediccion)
+MAPE_test_gbm <- MLmetrics::MAPE(y_pred = datos_test$log_error,y_true = datos_test$prediccion)
+MedianAE_test_gbm <- MLmetrics::MedianAE(y_pred = datos_test$log_error,y_true = datos_test$prediccion)
+```
+
+```{r, message = FALSE, warning=FALSE}
+paste("Error de test (RMSE) del modelo GBM:", rmse_test_gbm)
+paste("Error de test (MSE) del modelo GBM:", mse_test_gbm)
+paste("Error de test (MAE) del modelo GBM:", MAE_test_gbm)
+paste("Error de test (MAPE) del modelo GBM:", MAPE_test_gbm)
+paste("Error de test (MedianAE) del modelo GBM:", MedianAE_test_gbm)
+```
+
+
+### **4.2 XGBoost **
+
+Xgboost significa Extreme Gradient Boosting; este es una implementación específica del método Gradient Boosting Machine, que utiliza aproximaciones más precisas para encontrar el mejor modelo de árbol. Emplea una serie de algoritmos (trucos) que lo hacen realmente exitoso, sobre todo para datos estructurados. Los más importantes son los siguientes:
+
+*	Calcula gradientes de segundo orden, es decir, segundas derivadas parciales de la pérdida (parecido al método de Newton), lo que nos proporciona información de la dirección de los gradientes y la forma de llegar al mínimo de la función de pérdida. Si bien el aumento de gradiente regular utiliza la función de pérdida de un modelo base (como, por ejemplo, árbol de decisión), como intermediario para minimizar el error del modelo general, XGBoost usa la segunda derivada como una aproximación.
+
+*	XGBoost tiene una regularización avanzada que mejora la generación del modelo.
+Como se describe previamente, XGBoost tiene otras ventajas, que el entrenamiento es muy rápido, se puede paralelizar/distribuir a través de clusters.
+
+```{r, message = FALSE, warning=FALSE}
+filtrado$year_built <- as.factor(filtrado$year_built)
+filtrado$week_transaction <- as.factor(filtrado$week_transaction)
+datos_limpios <- filtrado
+```
+
+Sacamos las clases de las variables.
+```{r, message = FALSE, warning=FALSE}
+feature_classes <- sapply(names(datos_limpios), function(x) {
+  class(datos_limpios[[x]])})
+#feature_classes
+```
+
+Variables numéricas.
+```{r, message = FALSE, warning=FALSE}
+numeric_features <- names(feature_classes[feature_classes != "factor"])
+numeric_features
+```
+
+Seleccionamos las variables categóricas.
+```{r, message = FALSE, warning=FALSE}
+categorical_features <- names(feature_classes[feature_classes == "factor"])
+categorical_features
+```
+
+Creamos una tabla con las variables numericas.
+```{r, message = FALSE, warning=FALSE}
+total_numeric <- datos_limpios[, numeric_features]
+```
+
+One hot Enconding (Variables dummy para las variables categóricas)
+```{r, message = FALSE, warning=FALSE}
+total_categorical <- datos_limpios[, categorical_features]
+dummy <- dummyVars(" ~ .", data = total_categorical)
+#dataframe con las variables dummy
+total_categoric <- data.frame(predict(dummy, newdata = total_categorical))
+```
+Se crean n total de 277 variables categóricas
+
+Juntamos variables numéricas y las que hemos creado Dummy
+```{r, message = FALSE, warning=FALSE}
+total <- cbind(total_numeric, total_categoric)
+```
+Para crear XGboost poseemos un total de 296 variables
+
+Creamos dos datasets diferenciados por su County, uno para Los Angeles donde hay más observaciones, y luego uno formado por Orange y Ventura counties, que además de tener menos obervaciones se diferencian en el median family income, siendo mayor que LA, y pudiendo resultar en un modelo mejor.
+```{r,message = FALSE, warning=FALSE}
+datos_LA <- total %>% filter(id_county == 3101)
+datos_or_ve <- total %>% filter(id_county == 1286 | id_county == 2061)
+```
+
+Creamos ya las particiones train y test, un 80% para train y un 20% para test. 
+```{r, message = FALSE, warning=FALSE}
+set.seed(123)
+spec = c(train = .8, test = .2)
+
+g = sample(cut(
+  seq(nrow(total)), 
+  nrow(datos_or_ve)*cumsum(c(0,spec)),
+  labels = names(spec)))
+
+res_orve = split(datos_or_ve, g)
+
+g = sample(cut(
+  seq(nrow(total)), 
+  nrow(datos_LA)*cumsum(c(0,spec)),
+  labels = names(spec)))
+
+res_la = split(datos_LA, g)
+```
+Creamos una variable target y luego el conjunto de variables predictoras.
+```{r, message = FALSE, warning=FALSE}
+target_variable <- "log_error"
+candidate_features <- setdiff(names(total), c(target_variable))
+```
+
+Creamos una variable Outcome, que tendrá los datos del target.
+```{r, message = FALSE, warning=FALSE}
+outcome_la <- as.matrix(res_la$train$log_error)
+outcome_orve <- as.matrix(res_orve$train$log_error)
+```
+
+Creamos accesos directos a los dataset train y test, y les asignamos la clase matriz para introducirla a la matriz xgboost.
+```{r, message = FALSE, warning=FALSE}
+total_train_la <- res_la$train
+total_test_la <- res_la$test
+
+total_train_orve <- res_orve$train
+total_test_orve <- res_orve$test
+```
+
+Sparse Matrix
+```{r, message = FALSE, warning=FALSE}
+train_sparse_la <- sparse.model.matrix(~. , data = total_train_la)[,-1]
+test_sparse_la  <- sparse.model.matrix(~. , data = total_test_la)[,-1]
+
+train_sparse_orve <- sparse.model.matrix(~. , data = total_train_orve)[,-1]
+test_sparse_orve  <- sparse.model.matrix(~. , data = total_test_orve)[,-1]
+```
+
+Creamos las matrices de XGBoost
+```{r, message = FALSE, warning=FALSE}
+dtrain_la <- xgb.DMatrix(train_sparse_la, label = outcome_la)
+dtest_la  <- xgb.DMatrix(test_sparse_la)
+
+dtrain_orve <- xgb.DMatrix(train_sparse_orve, label = outcome_orve)
+dtest_orve  <- xgb.DMatrix(test_sparse_orve)
+set.seed(1235)
+```
+
+Primero entrenamos un Modelo XGBoost Cross Validation que nos permite mejorar de manera notoria los resultados de predicción gracias a la regularización que permite este modelo y que le diferencia de GBM, además de ofrecer el mejor boosting de gradiente. En este primer modelo se realizará la cross-validation, y en el siguiente sin ella, para comprobar si los buenos resultados de la primera son demasiado optimistas.
+
+Primero para Orange y Ventura counties.
+```{r, message = FALSE, warning=FALSE}
+param <- list(booster = "gblinear",
+              objective = "reg:linear",
+              eval_metric  = "mae",
+              eta=0.5,
+              gamma = 0.01,
+              alpha = 0.9,
+              lambda = 0.8)
+
+set.seed(123)
+modelo_orve <- xgb.cv( params = param, data = dtrain_orve, nrounds = 1500, nfold = 5, showsd = T, stratified = T, print_every_n = 500, early_stop_round = 50, maximize = F, prediction = T)
+```
+En este caso, sacamos con el modelo optimizado un error absoluto medio de 0.05 para la validación cruzada en los counties de Orange y Ventura. 
+```{r, message = FALSE, warning=FALSE}
+min(modelo_orve$evaluation_log$test_mae_mean)
+```
+
+Y ahora para Los Angeles County
+```{r, message = FALSE, warning=FALSE}
+param <- list(booster = "gblinear",
+              objective = "reg:linear",
+              eval_metric  = "mae",
+              eta=0.5,
+              gamma = 0.01,
+              alpha = 0.9,
+              lambda = 0.8)
+
+set.seed(123)
+modelo_la <- xgb.cv( params = param, data = dtrain_la, nrounds = 1500, nfold = 5, showsd = T, stratified = T, print_every_n = 500, early_stop_round = 50, maximize = F, prediction = T)
+```
+
+En este caso, sacamos con el modelo optimizado un error absoluto medio de 0.07 para la validación cruzada en Los Angeles.
+```{r, message = FALSE, warning=FALSE}
+min(modelo_la$evaluation_log$test_mae_mean)
+```
+
+Vamos a tratar de mejorar el modelo de Validación cruzada de XGBoost a través de una búsqueda de metaparámetros con GridSearch.
+Creamos un Grid con los metaparámetros para los modelos de OR y VEN, como para el de LA.
+```{r, message = FALSE, warning=FALSE}
+searchGridSubCol <- expand.grid(gamma = c(0,0.01,0.1),
+                                eta = c(0.1, 0.3, 0.5),
+                                alpha = c(0.7,0.8,0.9))
+```
+
+Grid Search para dataset de Orange y Ventura.
+```{r, message = FALSE, warning=FALSE}
+set.seed(123)
+system.time(
+rmseErrorsHyperparameters <- apply(searchGridSubCol, 1, function(parameterList){
+  
+  #Extraemos los parámetros para testear
+  currentEta <- parameterList[["eta"]]
+  currentGamma <- parameterList[["gamma"]]
+  currentAlpha <- parameterList[["alpha"]]
+  
+  param = list(eta = currentEta,
+               gamma = currentGamma,
+               alpha = currentAlpha,
+               eval_metric = "mae",
+               objective = "reg:linear",
+               booster = "gblinear")
+  
+  
+  #hacemos un modelo XGBoost Cross Validation
+  xgboostModelCV <- xgb.cv(data =  dtrain_orve, params = param, nrounds = 5000,
+                           nfold = 5, showsd = TRUE, 
+                           metrics = "mae", verbose = T,  
+                           print_every_n = 1000, early_stopping_rounds = 100)
+  
+  
+  xvalidationScores <- as.data.frame(xgboostModelCV$evaluation_log)
+  mae <- tail(xvalidationScores$test_mae_mean, 1)
+  trmae <- tail(xvalidationScores$train_mae_mean,1)
+  stop_it <- tail(xvalidationScores$st)
+  output <- return(c(mae, trmae, stop_it, currentEta, currentGamma, currentAlpha))}))
+```
+Y vemos los resultados ordenados de forma creciente por TestMAE para ver los metaparámetros que dieron un MAE más bajo en el test
+```{r, message = FALSE, warning=FALSE}
+set.seed(123)
+output <- as.data.frame(t(rmseErrorsHyperparameters))
+varnames <- c("TestMAE", "TrainMAE", "Eta", "Gamma", "Alpha")
+names(output) <- varnames
+output[order(output$TestMAE),]
+```
+
+Ahora probamos el mismo GridSearch para Los Angeles.
+```{r, message = FALSE, warning=FALSE}
+#Creamos un Grid para los modelos de OR y VEN, como para el de LA.
+searchGridSubCol <- expand.grid(gamma = c(0,0.01,0.1),
+                                eta = c(0.1, 0.3, 0.5),
+                                alpha = c(0.7,0.8,0.9))
+set.seed(1234)
+system.time(
+rmseErrorsHyperparameters <- apply(searchGridSubCol, 1, function(parameterList){
+  
+  #Extraemos los parámetros para testear
+  currentEta <- parameterList[["eta"]]
+  currentGamma <- parameterList[["gamma"]]
+  currentAlpha <- parameterList[["alpha"]]
+  
+  param = list(eta = currentEta,
+               gamma = currentGamma,
+               alpha = currentAlpha,
+               eval_metric = "mae",
+               objective = "reg:linear",
+               booster = "gblinear")
+  
+  
+  #hacemos un modelo XGBoost Cross Validation
+  xgboostModelCV <- xgb.cv(data =  dtrain_la, params = param, nrounds = 5000,
+                           nfold = 5, showsd = TRUE, 
+                           metrics = "mae", verbose = T,  
+                           print_every_n = 1000, early_stopping_rounds = 100)
+  
+  
+  xvalidationScores <- as.data.frame(xgboostModelCV$evaluation_log)
+  mae <- tail(xvalidationScores$test_mae_mean, 1)
+  trmae <- tail(xvalidationScores$train_mae_mean,1)
+  stop_it <- tail(xvalidationScores$st)
+  output <- return(c(mae, trmae, currentEta, currentGamma, currentAlpha))}))
+```
+
+Y vemos los resultados ordenados de forma creciente por TestMAE para ver los metaparámetros que dieron un MAE más bajo en el test.
+```{r, message = FALSE, warning=FALSE}
+set.seed(1234)
+output <- as.data.frame(t(rmseErrorsHyperparameters))
+varnames <- c("TestMAE", "TrainMAE", "Eta", "Gamma", "Alpha")
+names(output) <- varnames
+output[order(output$TestMAE),]
+```
+
+Vamos a tratar de hacer un modelo de XGBoost sin la validación cruzada, aplicándole los metaparámetros optimizados, y comparar los resultados con los modelos anteriores, para ver si la validación cruzada sobreajusta en exceso. 
+Para Orange y Ventura primero.
+```{r, message = FALSE, warning=FALSE}
+set.seed(1234)
+param <- list(booster = "gblinear",
+              objective = "reg:linear",
+              eval_metric  = "rmse",
+              eta=0.1,
+              gamma = 0.00,
+              alpha = 0.7)
+
+modelo_orve1 <- xgboost(params = param, data = dtrain_orve, nrounds = 5000, print_every_n = 1000, early_stop_round = 10, maximize = F, verbose = F)
+```
+
+Ahora hacemos la predicción del dataset Test con nuestro modelo entrenado, para ver los resultados de las métricas.
+```{r, message = FALSE, warning=FALSE}
+prediccion1 <- predict (modelo_orve1,dtest_orve)
+
+rmse_test_xgb <- RMSE( prediccion1, res_orve$test$log_error)
+paste("Error de test (RMSE) del modelo XGB:", rmse_test_xgb)
+
+mse_test_xgb <- MSE(prediccion1, res_orve$test$log_error)
+paste("Error de test (MSE) del modelo XGB:", mse_test_xgb)
+
+MAE_test_xgb <- MAE(prediccion1, res_orve$test$log_error)
+paste("Error de test (MAE) del modelo XGB:", MAE_test_xgb)
+
+MedianAE_test_xgb <- MedianAE(prediccion1, res_orve$test$log_error)
+paste("Error de test (MedianAE) del modelo XGB:", MedianAE_test_xgb)
+```
+
+Y ahora hacemos lo mismo para Los Angeles.
+```{r, message = FALSE, warning=FALSE}
+set.seed(1234)
+param <- list(booster = "gblinear",
+              objective = "reg:linear",
+              eval_metric  = "rmse",
+              eta=0.1,
+              gamma = 0.00,
+              alpha = 0.7)
+
+modelo_la1 <- xgboost(params = param, data = dtrain_la, nrounds = 5000, print_every_n = 1000, early_stop_round = 10, maximize = F, verbose = F)
+```
+
+Y de nuevo predecimos con el modelo la partición test de Los Angeles, para ver los resultados de las métricas.
+```{r, message = FALSE, warning=FALSE}
+prediccion2 <- predict (modelo_la1,dtest_la)
+
+rmse_test_xgb <- RMSE( prediccion2, res_la$test$log_error)
+paste("Error de test (RMSE) del modelo XGB:", rmse_test_xgb)
+
+mse_test_xgb <- MSE(prediccion2, res_la$test$log_error)
+paste("Error de test (MSE) del modelo XGB:", mse_test_xgb)
+
+MAE_test_xgb <- MAE(prediccion2, res_la$test$log_error)
+paste("Error de test (MAE) del modelo XGB:", MAE_test_xgb)
+
+MedianAE_test_xgb <- MedianAE(prediccion2, res_la$test$log_error)
+paste("Error de test (MedianAE) del modelo XGB:", MedianAE_test_xgb)
+```
+
+```{r, message = FALSE, warning=FALSE}
+importance_la <- xgb.importance(feature_names = train_sparse_la@Dimnames[[2]], 
+                             model = modelo_la1)
+importance_orve <- xgb.importance(feature_names = train_sparse_orve@Dimnames[[2]], 
+                             model = modelo_orve1)
+importance_orve
+importance_la
+```
+
+```{r}
+xgb.ggplot.importance(importance_la[1:10])
+xgb.ggplot.importance(importance_orve[1:10])
+```
+
+# **5. Conclusiones**
+
+XGBoost obtiene un RMSE para los 2 condados de media de 0,14 y GBM de 0,16
+
+XGBoost obtiene un MAE para los 2 condados de media de 0,06 y GBM de 0,065
+
+Como era previsible XGBoost obtiene mejores resultados que GBM pero también hay que remarcar que los resultados no son muy difernetes entre sí, sin embargo el nivel de abstracción entre un modelo u otro si que puede ser relevante.
